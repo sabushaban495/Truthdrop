@@ -12,6 +12,11 @@
 (define-constant err-cooldown-active (err u110))
 (define-constant err-invalid-tier (err u111))
 (define-constant err-stake-locked (err u112))
+(define-constant err-escrow-not-found (err u113))
+(define-constant err-escrow-not-released (err u114))
+(define-constant err-access-denied (err u115))
+(define-constant err-escrow-expired (err u116))
+(define-constant err-conditions-not-met (err u117))
 
 (define-data-var next-bounty-id uint u1)
 (define-data-var next-disclosure-id uint u1)
@@ -20,6 +25,8 @@
 (define-data-var min-stake-amount uint u5000000)
 (define-data-var stake-reward-rate uint u500)
 (define-data-var unstake-cooldown-blocks uint u1008)
+(define-data-var next-escrow-id uint u1)
+(define-data-var escrow-access-fee uint u1000000)
 
 (define-map bounties
   { bounty-id: uint }
@@ -95,6 +102,38 @@
 (define-map total-platform-stats
   { key: (string-ascii 20) }
   { value: uint }
+)
+
+(define-map evidence-escrows
+  { escrow-id: uint }
+  {
+    creator: principal,
+    encrypted-evidence-hash: (buff 32),
+    decryption-key-hash: (buff 32),
+    disclosure-id: uint,
+    release-conditions: (string-ascii 50),
+    auto-release-block: uint,
+    verification-threshold: uint,
+    access-price: uint,
+    status: (string-ascii 20),
+    total-purchasers: uint,
+    released: bool,
+    dispute-deadline: uint
+  }
+)
+
+(define-map escrow-access
+  { escrow-id: uint, accessor: principal }
+  {
+    paid-amount: uint,
+    access-granted: bool,
+    access-block: uint
+  }
+)
+
+(define-map escrow-funds
+  { escrow-id: uint }
+  { total-collected: uint }
 )
 
 ;; (define-nft truthdrop-nft uint)
@@ -535,6 +574,189 @@
   )
 )
 
+(define-private (check-escrow-release-conditions (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? evidence-escrows { escrow-id: escrow-id }) (ok false)))
+      (disclosure (map-get? disclosures { disclosure-id: (get disclosure-id escrow) }))
+      (verification (map-get? disclosure-verifications { disclosure-id: (get disclosure-id escrow) }))
+    )
+    (if (is-eq (get release-conditions escrow) "verification")
+      (match verification
+        ver-data (ok (get verified ver-data))
+        (ok false)
+      )
+      (if (is-eq (get release-conditions escrow) "time-lock")
+        (ok (>= stacks-block-height (get auto-release-block escrow)))
+        (if (is-eq (get release-conditions escrow) "payment-threshold")
+          (let
+            (
+              (funds (default-to { total-collected: u0 } (map-get? escrow-funds { escrow-id: escrow-id })))
+            )
+            (ok (>= (get total-collected funds) (get verification-threshold escrow)))
+          )
+          (ok false)
+        )
+      )
+    )
+  )
+)
+
+(define-public (create-evidence-escrow
+  (encrypted-evidence-hash (buff 32))
+  (decryption-key-hash (buff 32))
+  (disclosure-id uint)
+  (release-conditions (string-ascii 50))
+  (auto-release-blocks uint)
+  (verification-threshold uint)
+  (access-price uint))
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (auto-release-block (+ stacks-block-height auto-release-blocks))
+      (dispute-deadline (+ stacks-block-height (* auto-release-blocks u2)))
+    )
+    (asserts! (> access-price u0) err-invalid-amount)
+    (map-set evidence-escrows
+      { escrow-id: escrow-id }
+      {
+        creator: tx-sender,
+        encrypted-evidence-hash: encrypted-evidence-hash,
+        decryption-key-hash: decryption-key-hash,
+        disclosure-id: disclosure-id,
+        release-conditions: release-conditions,
+        auto-release-block: auto-release-block,
+        verification-threshold: verification-threshold,
+        access-price: access-price,
+        status: "active",
+        total-purchasers: u0,
+        released: false,
+        dispute-deadline: dispute-deadline
+      }
+    )
+    (map-set escrow-funds { escrow-id: escrow-id } { total-collected: u0 })
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (purchase-escrow-access (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? evidence-escrows { escrow-id: escrow-id }) err-escrow-not-found))
+      (existing-access (map-get? escrow-access { escrow-id: escrow-id, accessor: tx-sender }))
+      (funds (default-to { total-collected: u0 } (map-get? escrow-funds { escrow-id: escrow-id })))
+    )
+    (asserts! (is-eq (get status escrow) "active") err-escrow-expired)
+    (asserts! (is-none existing-access) err-already-exists)
+    (try! (stx-transfer? (get access-price escrow) tx-sender (get creator escrow)))
+    (map-set escrow-access
+      { escrow-id: escrow-id, accessor: tx-sender }
+      {
+        paid-amount: (get access-price escrow),
+        access-granted: false,
+        access-block: stacks-block-height
+      }
+    )
+    (map-set escrow-funds
+      { escrow-id: escrow-id }
+      { total-collected: (+ (get total-collected funds) (get access-price escrow)) }
+    )
+    (map-set evidence-escrows
+      { escrow-id: escrow-id }
+      (merge escrow { total-purchasers: (+ (get total-purchasers escrow) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (release-escrow-evidence (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? evidence-escrows { escrow-id: escrow-id }) err-escrow-not-found))
+      (conditions-met (unwrap! (check-escrow-release-conditions escrow-id) err-conditions-not-met))
+    )
+    (asserts! (or (is-eq tx-sender (get creator escrow)) (is-eq tx-sender contract-owner)) err-unauthorized)
+    (asserts! conditions-met err-conditions-not-met)
+    (asserts! (not (get released escrow)) err-already-exists)
+    (map-set evidence-escrows
+      { escrow-id: escrow-id }
+      (merge escrow { status: "released", released: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-escrow-access (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? evidence-escrows { escrow-id: escrow-id }) err-escrow-not-found))
+      (access (unwrap! (map-get? escrow-access { escrow-id: escrow-id, accessor: tx-sender }) err-access-denied))
+    )
+    (asserts! (get released escrow) err-escrow-not-released)
+    (asserts! (not (get access-granted access)) err-already-exists)
+    (map-set escrow-access
+      { escrow-id: escrow-id, accessor: tx-sender }
+      (merge access { access-granted: true })
+    )
+    (ok {
+      encrypted-evidence: (get encrypted-evidence-hash escrow),
+      decryption-key: (get decryption-key-hash escrow)
+    })
+  )
+)
+
+(define-public (dispute-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? evidence-escrows { escrow-id: escrow-id }) err-escrow-not-found))
+      (access (unwrap! (map-get? escrow-access { escrow-id: escrow-id, accessor: tx-sender }) err-access-denied))
+    )
+    (asserts! (< stacks-block-height (get dispute-deadline escrow)) err-escrow-expired)
+    (asserts! (not (get released escrow)) err-already-exists)
+    (asserts! (> (get paid-amount access) u0) err-access-denied)
+    (try! (as-contract (stx-transfer? (get paid-amount access) tx-sender tx-sender)))
+    (map-delete escrow-access { escrow-id: escrow-id, accessor: tx-sender })
+    (let
+      (
+        (funds (default-to { total-collected: u0 } (map-get? escrow-funds { escrow-id: escrow-id })))
+      )
+      (map-set escrow-funds
+        { escrow-id: escrow-id }
+        { total-collected: (- (get total-collected funds) (get paid-amount access)) }
+      )
+      (map-set evidence-escrows
+        { escrow-id: escrow-id }
+        (merge escrow { total-purchasers: (- (get total-purchasers escrow) u1) })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (force-release-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? evidence-escrows { escrow-id: escrow-id }) err-escrow-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= stacks-block-height (get dispute-deadline escrow)) err-escrow-expired)
+    (map-set evidence-escrows
+      { escrow-id: escrow-id }
+      (merge escrow { status: "force-released", released: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-escrow-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set escrow-access-fee new-fee)
+    (ok true)
+  )
+)
+
 (define-read-only (get-bounty (bounty-id uint))
   (map-get? bounties { bounty-id: bounty-id })
 )
@@ -616,4 +838,30 @@
   )
 )
 
+(define-read-only (get-evidence-escrow (escrow-id uint))
+  (map-get? evidence-escrows { escrow-id: escrow-id })
+)
+
+(define-read-only (get-escrow-access (escrow-id uint) (accessor principal))
+  (map-get? escrow-access { escrow-id: escrow-id, accessor: accessor })
+)
+
+(define-read-only (get-escrow-funds (escrow-id uint))
+  (map-get? escrow-funds { escrow-id: escrow-id })
+)
+
+(define-read-only (check-escrow-conditions (escrow-id uint))
+  (check-escrow-release-conditions escrow-id)
+)
+
+(define-read-only (get-escrow-parameters)
+  {
+    next-escrow-id: (var-get next-escrow-id),
+    escrow-access-fee: (var-get escrow-access-fee)
+  }
+)
+
 (initialize-stake-tiers)
+
+
+
