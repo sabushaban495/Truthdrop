@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Truthdrop.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.disclosure-impact-tracker]
+path = 'contracts/disclosure-impact-tracker.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
